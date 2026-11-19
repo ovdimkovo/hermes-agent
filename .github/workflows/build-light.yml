@@ -45,7 +45,7 @@ jobs:
           - { name: macos-arm64, os: macos-26 }
           - { name: windows-x64, os: windows-latest }
           # Unpacked app folder zipped for Windows: no MSIX, no certificate, just run the exe.
-          - { name: windows-x64-portable, os: windows-latest, args: '-- --dir' }
+          - { name: windows-x64-portable, os: windows-latest, portable: true }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     steps:
@@ -59,6 +59,7 @@ jobs:
         shell: bash
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          PORTABLE: ${{ matrix.portable }}
         run: |
           set -euo pipefail
           version="$INPUT_VERSION"
@@ -100,6 +101,16 @@ jobs:
           t = t.replace(old, "display: 'hermes-light',\n    kebab: 'hermes-light',\n    pascal: 'hermes-light'", 1)
           open(f, 'w', encoding='utf-8', newline='').write(t)
           PY
+          if [ "$PORTABLE" = "true" ]; then
+            # Portable build: only the unpacked app folder, no MSIX package at all.
+            python - <<'PY'
+          f = 'scripts/bundles/desktop.py'
+          t = open(f, encoding='utf-8').read()
+          old = '"win32": ["--win", "msix"]'
+          assert old in t, 'win32 target not found'
+          open(f, 'w', encoding='utf-8', newline='').write(t.replace(old, '"win32": ["--win", "dir"]', 1))
+          PY
+          fi
           git -c user.name=ci -c user.email=ci@example.invalid commit -qam "build: version $version, local publisher"
           echo "HERMES_LIGHT_VERSION=$version" >> "$GITHUB_ENV"
       - name: Build light variant
@@ -107,8 +118,7 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           PYTHONUTF8: '1'
-          BUILDER_ARGS: ${{ matrix.args }}
-        run: python scripts/bundles/desktop.py --commit "$(git rev-parse HEAD)" --variant light --clean $BUILDER_ARGS
+        run: python scripts/bundles/desktop.py --commit "$(git rev-parse HEAD)" --variant light --clean
       - name: List output
         shell: bash
         run: ls -lh apps/desktop/release
