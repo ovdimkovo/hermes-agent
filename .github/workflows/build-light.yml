@@ -118,44 +118,69 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # The MSIX manifest Publisher must equal the signing certificate subject.
-          $subject = 'OID.2.25.311729368913984317654407730594956997722=1'
+          $oid = '2.25.311729368913984317654407730594956997722'
+          $subject = "OID.$oid=1"
           $msix = Get-ChildItem apps/desktop/release -Filter *.msix | Select-Object -First 1
           if (-not $msix) { throw 'no .msix found' }
 
-          # Show the Publisher the package really carries.
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($msix.FullName)
           try {
-            $entry = $zip.GetEntry('AppxManifest.xml')
-            $reader = New-Object System.IO.StreamReader($entry.Open())
+            $reader = New-Object System.IO.StreamReader($zip.GetEntry('AppxManifest.xml').Open())
             $xml = [xml]$reader.ReadToEnd(); $reader.Close()
           } finally { $zip.Dispose() }
-          $publisher = $xml.Package.Identity.Publisher
-          Write-Host "Manifest Publisher: $publisher"
-          if ($publisher -ne $subject) { throw "Manifest Publisher differs from the expected subject" }
+          Write-Host "Manifest Publisher: $($xml.Package.Identity.Publisher)"
+          if ($xml.Package.Identity.Publisher -ne $subject) { throw 'Manifest Publisher differs from the expected subject' }
 
-          $cert = New-SelfSignedCertificate -Type Custom -Subject $subject `
-            -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
-            -FriendlyName 'Hermes Light (self-signed)' -CertStoreLocation Cert:\CurrentUser\My `
-            -NotAfter (Get-Date).AddYears(5) `
-            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
-          Write-Host "Certificate subject: $($cert.Subject)"
-
-          $cerPath = Join-Path (Resolve-Path apps/desktop/release) ("HermesLight-$env:HERMES_LIGHT_VERSION-win-x64.cer")
-          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-
-          $pwd = [guid]::NewGuid().ToString('N')
-          $pfx = Join-Path $env:RUNNER_TEMP 'hermes-light.pfx'
-          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pwd -AsPlainText -Force) | Out-Null
-
+          $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
             Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $signtool) { throw 'signtool.exe not found' }
-          & $signtool.FullName sign /fd SHA256 /f $pfx /p $pwd $msix.FullName
-          if ($LASTEXITCODE -ne 0) { throw "signtool failed with $LASTEXITCODE" }
-          Remove-Item $pfx -Force
-          Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force
-          Write-Host 'MSIX signed. Private key discarded; import the .cer to trust this build.'
+
+          $release = (Resolve-Path apps/desktop/release).Path
+          $cerPath = Join-Path $release "HermesLight-$env:HERMES_LIGHT_VERSION-win-x64.cer"
+          $pwd = [guid]::NewGuid().ToString('N')
+          $backup = Join-Path $env:RUNNER_TEMP 'unsigned.msix'
+          Copy-Item $msix.FullName $backup
+          $signed = $false
+
+          # The subject attribute is not a standard one, so the ASN.1 string type of its value matters.
+          foreach ($mask in 'pkix', 'utf8only') {
+            Write-Host "--- trying string_mask=$mask"
+            $dir = Join-Path $env:RUNNER_TEMP "cert-$mask"; New-Item -ItemType Directory -Force $dir | Out-Null
+            @"
+          [req]
+          distinguished_name = dn
+          prompt = no
+          string_mask = $mask
+          x509_extensions = ext
+          [dn]
+          CN = placeholder
+          [ext]
+          basicConstraints = critical,CA:FALSE
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = codeSigning
+          "@ | Set-Content -Path (Join-Path $dir 'openssl.cnf') -Encoding ascii
+            & $openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 1825 `
+              -config (Join-Path $dir 'openssl.cnf') -subj "/$oid=1" `
+              -keyout (Join-Path $dir 'key.pem') -out (Join-Path $dir 'cert.pem')
+            if ($LASTEXITCODE -ne 0) { Write-Host "openssl req failed"; continue }
+            & $openssl x509 -in (Join-Path $dir 'cert.pem') -noout -subject -nameopt oid
+            & $openssl pkcs12 -export -inkey (Join-Path $dir 'key.pem') -in (Join-Path $dir 'cert.pem') `
+              -out (Join-Path $dir 'cert.pfx') -passout "pass:$pwd"
+            if ($LASTEXITCODE -ne 0) { Write-Host "openssl pkcs12 failed"; continue }
+            Copy-Item $backup $msix.FullName -Force
+            & $signtool.FullName sign /fd SHA256 /f (Join-Path $dir 'cert.pfx') /p $pwd $msix.FullName
+            if ($LASTEXITCODE -eq 0) {
+              & $openssl x509 -in (Join-Path $dir 'cert.pem') -outform der -out $cerPath
+              $signed = $true
+              Write-Host "Signed with string_mask=$mask"
+              break
+            }
+            Write-Host "signtool failed for string_mask=$mask ($LASTEXITCODE)"
+          }
+          Remove-Item $backup -Force
+          if (-not $signed) { throw 'could not sign the MSIX with any certificate variant' }
 
       - name: Publish to the hermes-light release
         shell: bash
