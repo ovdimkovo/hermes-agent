@@ -90,6 +90,15 @@ jobs:
           assert old in t, 'publisherDisplayName not found'
           t = t.replace(old, ": 'Hermes Light',", 1)
           open(f, 'w', encoding='utf-8', newline='').write(t)
+          # Plain product name "hermes-light": no commit suffix in the exe, app name, appId or data paths.
+          f = 'apps/desktop/product-identity.cjs'
+          t = open(f, encoding='utf-8').read()
+          t, n = re.subn(r"const buildCommit = [^\n]*", "const buildCommit = null", t, count=1)
+          assert n == 1, 'buildCommit line not found'
+          old = "display: 'Hermes Light',\n    kebab: 'hermes-light',\n    pascal: 'HermesLight'"
+          assert old in t, 'light variant names not found'
+          t = t.replace(old, "display: 'hermes-light',\n    kebab: 'hermes-light',\n    pascal: 'hermes-light'", 1)
+          open(f, 'w', encoding='utf-8', newline='').write(t)
           PY
           git -c user.name=ci -c user.email=ci@example.invalid commit -qam "build: version $version, local publisher"
           echo "HERMES_LIGHT_VERSION=$version" >> "$GITHUB_ENV"
@@ -166,7 +175,7 @@ jobs:
           $dir = Get-ChildItem apps/desktop/release -Directory -Filter 'win*unpacked' | Select-Object -First 1
           if (-not $dir) { throw 'no win-unpacked folder in the release output' }
           Get-ChildItem $dir.FullName -Filter *.exe | Format-Table Name, Length
-          $zip = "apps/desktop/release/HermesLight-$env:HERMES_LIGHT_VERSION-win-x64-portable.zip"
+          $zip = "apps/desktop/release/hermes-light-$env:HERMES_LIGHT_VERSION-win-x64-portable.zip"
           Compress-Archive -Path (Join-Path $dir.FullName '*') -DestinationPath $zip -CompressionLevel Optimal
           Get-Item $zip | Format-Table Name, Length
 
