@@ -73,7 +73,23 @@ jobs:
           assert n == 1
           open('pyproject.toml', 'w', encoding='utf-8', newline='').write(p)
           PY
-          git -c user.name=ci -c user.email=ci@example.invalid commit -qam "build: version $version"
+          # Replace the upstream signer identity in the MSIX manifest with our own subject.
+          python - <<'PY'
+          import re
+          subject = 'OID.2.25.311729368913984317654407730594956997722=1'
+          f = 'scripts/msix-shared.mjs'
+          t = open(f, encoding='utf-8').read()
+          t, n = re.subn(r"(export const OUT_OF_STORE_PUBLISHER =\s*)'[^']*'", lambda m: m.group(1) + "'" + subject + "'", t, count=1)
+          assert n == 1, 'publisher constant not found'
+          open(f, 'w', encoding='utf-8', newline='').write(t)
+          f = 'apps/desktop/electron-builder.config.cjs'
+          t = open(f, encoding='utf-8').read()
+          old = ": 'Nous Research',"
+          assert old in t, 'publisherDisplayName not found'
+          t = t.replace(old, ": 'Hermes Light',", 1)
+          open(f, 'w', encoding='utf-8', newline='').write(t)
+          PY
+          git -c user.name=ci -c user.email=ci@example.invalid commit -qam "build: version $version, local publisher"
           echo "HERMES_LIGHT_VERSION=$version" >> "$GITHUB_ENV"
       - name: Build light variant
         shell: bash
