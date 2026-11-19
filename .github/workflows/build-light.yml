@@ -76,7 +76,7 @@ jobs:
           # Replace the upstream signer identity in the MSIX manifest with our own subject.
           python - <<'PY'
           import re
-          subject = 'OID.2.25.311729368913984317654407730594956997722=1'
+          subject = 'CN=Hermes Light'
           f = 'scripts/msix-shared.mjs'
           t = open(f, encoding='utf-8').read()
           t, n = re.subn(r"(export const OUT_OF_STORE_PUBLISHER =\s*)'[^']*'", lambda m: m.group(1) + "'" + subject + "'", t, count=1)
@@ -118,8 +118,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # The MSIX manifest Publisher must equal the signing certificate subject.
-          $oid = '2.25.311729368913984317654407730594956997722'
-          $subject = "OID.$oid=1"
+          $subject = 'CN=Hermes Light'
           $msix = Get-ChildItem apps/desktop/release -Filter *.msix | Select-Object -First 1
           if (-not $msix) { throw 'no .msix found' }
 
@@ -130,70 +129,30 @@ jobs:
             $xml = [xml]$reader.ReadToEnd(); $reader.Close()
           } finally { $zip.Dispose() }
           Write-Host "Manifest Publisher: $($xml.Package.Identity.Publisher)"
+          Write-Host "Publisher display name: $($xml.Package.Properties.PublisherDisplayName)"
           if ($xml.Package.Identity.Publisher -ne $subject) { throw 'Manifest Publisher differs from the expected subject' }
+
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $subject `
+            -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
+            -FriendlyName 'Hermes Light (self-signed)' -CertStoreLocation Cert:\CurrentUser\My `
+            -NotAfter (Get-Date).AddYears(5) `
+            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+          Write-Host "Certificate subject: $($cert.Subject)"
+
+          $release = (Resolve-Path apps/desktop/release).Path
+          Export-Certificate -Cert $cert -FilePath (Join-Path $release "HermesLight-$env:HERMES_LIGHT_VERSION-win-x64.cer") | Out-Null
+          $pwd = [guid]::NewGuid().ToString('N')
+          $pfx = Join-Path $env:RUNNER_TEMP 'hermes-light.pfx'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pwd -AsPlainText -Force) | Out-Null
 
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
             Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $signtool) { throw 'signtool.exe not found' }
-
-          # Build the subject by hand (DER): the attribute type is an unregistered OID,
-          # so the string type of its value ("1") has to be chosen explicitly.
-          function ConvertTo-Base128([System.Numerics.BigInteger]$n) {
-            $b = New-Object System.Collections.Generic.List[byte]
-            $b.Add([byte][int][System.Numerics.BigInteger]::Remainder($n, 128))
-            $n = [System.Numerics.BigInteger]::Divide($n, 128)
-            while ($n -gt 0) {
-              $b.Add([byte](128 + [int][System.Numerics.BigInteger]::Remainder($n, 128)))
-              $n = [System.Numerics.BigInteger]::Divide($n, 128)
-            }
-            $b.Reverse()
-            return ,$b.ToArray()
-          }
-          function New-SubjectDer([byte]$stringTag) {
-            $arc = [System.Numerics.BigInteger]::Parse('311729368913984317654407730594956997722')
-            $oidBody = [byte[]](@(0x69) + (ConvertTo-Base128 $arc))     # 2.25.<arc>: first byte = 2*40+25
-            $oidTlv  = [byte[]](@(0x06, $oidBody.Length) + $oidBody)
-            $valTlv  = [byte[]](@($stringTag, 0x01, 0x31))               # "1"
-            $atv     = [byte[]](@(0x30, ($oidTlv.Length + $valTlv.Length)) + $oidTlv + $valTlv)
-            $set     = [byte[]](@(0x31, $atv.Length) + $atv)
-            return ,[byte[]](@(0x30, $set.Length) + $set)
-          }
-
-          $release = (Resolve-Path apps/desktop/release).Path
-          $cerPath = Join-Path $release "HermesLight-$env:HERMES_LIGHT_VERSION-win-x64.cer"
-          $pwd = [guid]::NewGuid().ToString('N')
-          $backup = Join-Path $env:RUNNER_TEMP 'unsigned.msix'
-          Copy-Item $msix.FullName $backup
-          $signed = $false
-
-          foreach ($tag in @(0x13, 0x0C)) {   # PrintableString, then UTF8String
-            Write-Host ('--- trying value string tag 0x{0:X2}' -f $tag)
-            $der = New-SubjectDer ([byte]$tag)
-            $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName(,$der)
-            Write-Host "Subject as Windows renders it: $($dn.Name)"
-            $rsa = [System.Security.Cryptography.RSA]::Create(3072)
-            $req = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest($dn, $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-            $req.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension($false, $false, 0, $true)))
-            $req.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509KeyUsageExtension([System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature, $true)))
-            $ekus = New-Object System.Security.Cryptography.OidCollection
-            [void]$ekus.Add((New-Object System.Security.Cryptography.Oid('1.3.6.1.5.5.7.3.3')))
-            $req.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension($ekus, $true)))
-            $cert = $req.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddYears(5))
-            Write-Host "Certificate subject: $($cert.Subject)"
-            $pfx = Join-Path $env:RUNNER_TEMP "hermes-light-$tag.pfx"
-            [System.IO.File]::WriteAllBytes($pfx, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $pwd))
-            Copy-Item $backup $msix.FullName -Force
-            & $signtool.FullName sign /fd SHA256 /f $pfx /p $pwd $msix.FullName
-            if ($LASTEXITCODE -eq 0) {
-              [System.IO.File]::WriteAllBytes($cerPath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-              $signed = $true
-              Write-Host ('Signed with string tag 0x{0:X2}' -f $tag)
-              break
-            }
-            Write-Host ('signtool failed for tag 0x{0:X2} ({1})' -f $tag, $LASTEXITCODE)
-          }
-          Remove-Item $backup -Force
-          if (-not $signed) { throw 'could not sign the MSIX with any certificate variant' }
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p $pwd $msix.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with $LASTEXITCODE" }
+          Remove-Item $pfx -Force
+          Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force
+          Write-Host 'MSIX signed. Private key discarded; import the .cer to trust this build.'
 
       - name: Publish to the hermes-light release
         shell: bash
