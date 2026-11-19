@@ -17,10 +17,24 @@ on:
     branches: [build-light-desktop]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  prepare:
+    name: prepare release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Create the release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view hermes-light -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create hermes-light -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+              --title "Hermes Light (remote-only desktop client)" \
+              --notes "Unsigned builds of the Hermes Light desktop client. Connect it to a remote Hermes backend."
+
   build:
+    needs: prepare
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -81,3 +95,15 @@ jobs:
             apps/desktop/release/*.msixbundle
             apps/desktop/release/*.appinstaller
           if-no-files-found: error
+      - name: Publish to the hermes-light release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=()
+          for ext in AppImage dmg zip msix msixbundle appinstaller; do
+            for f in apps/desktop/release/*."$ext"; do [ -f "$f" ] && files+=("$f"); done
+          done
+          [ ${#files[@]} -gt 0 ] || { echo "no files to publish"; exit 1; }
+          gh release upload hermes-light "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
