@@ -1,197 +1,196 @@
 name: Build Hermes Light
 
-# Remote-only desktop client (HERMES_DESKTOP_VARIANT=light): no Python, no local agent.
-# Same driver as the upstream release workflow, unsigned, no secrets.
+# Builds the remote-only Hermes desktop client ("light" variant: no Python, no local agent)
+# from the official NousResearch/hermes-agent repository and publishes it as a GitHub release.
+# This repository holds no Hermes code: each run checks out the upstream release tag.
 #
-# main carries version 0.0.0 on purpose; the real version comes from the release tag.
-# This workflow reads the newest stable vX.Y.Z tag (not the older CalVer v2026.M.D tags) from upstream and bakes it into
-# a local commit before building, so artifact names and the app show that version.
+# Once a day the workflow looks up the newest stable upstream tag (vX.Y.Z). If this repository
+# has no release for it yet, it builds Linux, macOS and Windows and publishes one release.
+# A release is created only when all three builds succeed, so a failed run is retried the next day.
+
 on:
+  schedule:
+    - cron: '17 3 * * *'
+  push:
+    branches: [build-light-desktop]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version X.Y.Z. Empty = newest stable tag of NousResearch/hermes-agent'
+        description: 'Upstream version X.Y.Z. Empty = newest stable tag'
         required: false
         default: ''
-  push:
-    branches: [build-light-desktop]
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-hermes-light
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: NousResearch/hermes-agent
+  # Tag name of the release in this repository: <prefix><version>.
+  RELEASE_TAG_PREFIX: test-light-v
+
 jobs:
-  prepare:
-    name: prepare release
-    runs-on: ubuntu-22.04
+  check:
+    name: check upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
     steps:
-      - name: Create the release if missing
+      - id: check
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view hermes-light -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create hermes-light -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-              --title "Hermes Light (remote-only desktop client)" \
-              --notes "Unsigned builds of the Hermes Light desktop client. Connect it to a remote Hermes backend."
-
-  build:
-    needs: prepare
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # 22.04 keeps the AppImage runnable on older glibc, as the upstream Linux job does.
-          - { name: linux-x64, os: ubuntu-22.04 }
-          - { name: macos-arm64, os: macos-26 }
-          - { name: windows-x64, os: windows-latest }
-          # Unpacked app folder zipped for Windows: no MSIX, no certificate, just run the exe.
-          - { name: windows-x64-portable, os: windows-latest, args: '-- --dir' }
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Set release version
-        shell: bash
-        env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
           version="$INPUT_VERSION"
           if [ -z "$version" ]; then
-            version=$(git ls-remote --tags https://github.com/NousResearch/hermes-agent 'refs/tags/v*' \
-              | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^v[0-9]{1,3}\.[0-9]+\.[0-9]+$' | sort -V | tail -1 | sed 's/^v//')
+            # Stable tags only; skip canaries and the old CalVer tags (v2026.M.D).
+            version=$(git ls-remote --tags "https://github.com/$UPSTREAM" 'refs/tags/v*' \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^v[0-9]{1,3}\.[0-9]+\.[0-9]+$' | sort -V | tail -1 | sed 's/^v//')
           fi
           echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad version: $version"; exit 1; }
-          echo "Building version $version"
-          python - "$version" <<'PY'
-          import re, sys
-          p = open('pyproject.toml', encoding='utf-8').read()
-          p, n = re.subn(r'(?m)^version = "[^"]*"', f'version = "{sys.argv[1]}"', p, count=1)
-          assert n == 1
-          open('pyproject.toml', 'w', encoding='utf-8', newline='').write(p)
-          PY
-          # Replace the upstream signer identity in the MSIX manifest with our own subject.
-          python - <<'PY'
-          import re
-          subject = 'CN=Hermes Light'
-          f = 'scripts/msix-shared.mjs'
-          t = open(f, encoding='utf-8').read()
-          t, n = re.subn(r"(export const OUT_OF_STORE_PUBLISHER =\s*)'[^']*'", lambda m: m.group(1) + "'" + subject + "'", t, count=1)
-          assert n == 1, 'publisher constant not found'
-          open(f, 'w', encoding='utf-8', newline='').write(t)
-          f = 'apps/desktop/electron-builder.config.cjs'
-          t = open(f, encoding='utf-8').read()
-          old = ": 'Nous Research',"
-          assert old in t, 'publisherDisplayName not found'
-          t = t.replace(old, ": 'Hermes Light',", 1)
-          # MSIX Application.Id cannot contain a hyphen: keep a valid id there only.
-          old = 'applicationId: appNamePascal,'
-          assert old in t, 'msix applicationId not found'
-          t = t.replace(old, "applicationId: 'HermesLight',", 1)
-          open(f, 'w', encoding='utf-8', newline='').write(t)
-          # Plain product name "hermes-light": no commit suffix in the exe, app name, appId or data paths.
-          f = 'apps/desktop/product-identity.cjs'
-          t = open(f, encoding='utf-8').read()
-          t, n = re.subn(r"const buildCommit = [^\n]*", "const buildCommit = null", t, count=1)
-          assert n == 1, 'buildCommit line not found'
-          old = "display: 'Hermes Light',\n    kebab: 'hermes-light',\n    pascal: 'HermesLight'"
-          assert old in t, 'light variant names not found'
-          t = t.replace(old, "display: 'hermes-light',\n    kebab: 'hermes-light',\n    pascal: 'hermes-light'", 1)
-          open(f, 'w', encoding='utf-8', newline='').write(t)
-          PY
-          git -c user.name=ci -c user.email=ci@example.invalid commit -qam "build: version $version, local publisher"
-          echo "HERMES_LIGHT_VERSION=$version" >> "$GITHUB_ENV"
-      - name: Build light variant
+          tag="$RELEASE_TAG_PREFIX$version"
+          if [ "$FORCE" != "true" ] && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+            build=false
+          else
+            echo "Building $version."
+            build=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 keeps the AppImage runnable on older glibc.
+          - { name: linux-x64, os: ubuntu-22.04, args: '' }
+          # macos-14 is retired; macos-15 arm64 has long queues.
+          - { name: macos-arm64, os: macos-26, args: '' }
+          # Unpacked app folder, zipped: no MSIX, no certificate.
+          - { name: windows-x64, os: windows-latest, args: '-- --dir' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Check out upstream v${{ needs.check.outputs.version }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: v${{ needs.check.outputs.version }}
+          fetch-depth: 1
+          path: src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare the source
         shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          python - "$VERSION" <<'PY'
+          import re, sys
+
+          def patch(path, old, new, regex=False):
+              text = open(path, encoding='utf-8').read()
+              if regex:
+                  text, n = re.subn(old, new, text, count=1)
+              else:
+                  n = text.count(old)
+                  text = text.replace(old, new, 1)
+              assert n >= 1, f'{path}: pattern not found: {old!r}'
+              open(path, 'w', encoding='utf-8', newline='').write(text)
+
+          # Upstream keeps 0.0.0 in pyproject; the release version comes from the tag.
+          patch('pyproject.toml', r'(?m)^version = "[^"]*"', f'version = "{sys.argv[1]}"', regex=True)
+          # Plain name "hermes-light": no commit suffix in the exe, app name or data paths.
+          patch('apps/desktop/product-identity.cjs', r'const buildCommit = [^\n]*', 'const buildCommit = null', regex=True)
+          patch('apps/desktop/product-identity.cjs',
+                "display: 'Hermes Light',\n    kebab: 'hermes-light',\n    pascal: 'HermesLight'",
+                "display: 'hermes-light',\n    kebab: 'hermes-light',\n    pascal: 'hermes-light'")
+          # The Windows build still packs an MSIX, whose Application.Id cannot contain a hyphen.
+          patch('apps/desktop/electron-builder.config.cjs', 'applicationId: appNamePascal,', "applicationId: 'HermesLight',")
+          PY
+          # The build driver packages HEAD and refuses a dirty tree.
+          git -c user.name=ci -c user.email=ci@example.invalid commit -qam "hermes-light $VERSION"
+
+      - name: Build
+        shell: bash
+        working-directory: src
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           PYTHONUTF8: '1'
-          BUILDER_ARGS: ${{ matrix.args }}
-        run: python scripts/bundles/desktop.py --commit "$(git rev-parse HEAD)" --variant light --clean $BUILDER_ARGS
-      - name: List output
+        run: python scripts/bundles/desktop.py --commit "$(git rev-parse HEAD)" --variant light --clean ${{ matrix.args }}
+
+      - name: Collect files
         shell: bash
-        run: ls -lh apps/desktop/release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hermes-light-${{ env.HERMES_LIGHT_VERSION }}-${{ matrix.name }}
-          path: |
-            apps/desktop/release/*.AppImage
-            apps/desktop/release/*.dmg
-            apps/desktop/release/*.zip
-            apps/desktop/release/*.msix
-            apps/desktop/release/*.msixbundle
-            apps/desktop/release/*.appinstaller
-            apps/desktop/release/*.cer
-          if-no-files-found: error
-      - name: Sign MSIX with a self-signed certificate (Windows)
-        if: matrix.name == 'windows-x64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # The MSIX manifest Publisher must equal the signing certificate subject.
-          $subject = 'CN=Hermes Light'
-          $msix = Get-ChildItem apps/desktop/release -Filter *.msix | Select-Object -First 1
-          if (-not $msix) { throw 'no .msix found' }
-
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($msix.FullName)
-          try {
-            $reader = New-Object System.IO.StreamReader($zip.GetEntry('AppxManifest.xml').Open())
-            $xml = [xml]$reader.ReadToEnd(); $reader.Close()
-          } finally { $zip.Dispose() }
-          Write-Host "Manifest Publisher: $($xml.Package.Identity.Publisher)"
-          Write-Host "Publisher display name: $($xml.Package.Properties.PublisherDisplayName)"
-          if ($xml.Package.Identity.Publisher -ne $subject) { throw 'Manifest Publisher differs from the expected subject' }
-
-          $cert = New-SelfSignedCertificate -Type Custom -Subject $subject `
-            -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
-            -FriendlyName 'Hermes Light (self-signed)' -CertStoreLocation Cert:\CurrentUser\My `
-            -NotAfter (Get-Date).AddYears(5) `
-            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
-          Write-Host "Certificate subject: $($cert.Subject)"
-
-          $release = (Resolve-Path apps/desktop/release).Path
-          Export-Certificate -Cert $cert -FilePath (Join-Path $release "HermesLight-$env:HERMES_LIGHT_VERSION-win-x64.cer") | Out-Null
-          $pwd = [guid]::NewGuid().ToString('N')
-          $pfx = Join-Path $env:RUNNER_TEMP 'hermes-light.pfx'
-          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pwd -AsPlainText -Force) | Out-Null
-
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw 'signtool.exe not found' }
-          & $signtool.FullName sign /fd SHA256 /f $pfx /p $pwd $msix.FullName
-          if ($LASTEXITCODE -ne 0) { throw "signtool failed with $LASTEXITCODE" }
-          Remove-Item $pfx -Force
-          Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force
-          Write-Host 'MSIX signed. Private key discarded; import the .cer to trust this build.'
-
-      - name: Zip the portable Windows build
-        if: matrix.name == 'windows-x64-portable'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Get-ChildItem apps/desktop/release | Format-Table Name, Length
-          $dir = Get-ChildItem apps/desktop/release -Directory -Filter 'win*unpacked' | Select-Object -First 1
-          if (-not $dir) { throw 'no win-unpacked folder in the release output' }
-          Get-ChildItem $dir.FullName -Filter *.exe | Format-Table Name, Length
-          $zip = "apps/desktop/release/hermes-light-$env:HERMES_LIGHT_VERSION-win-x64-portable.zip"
-          Compress-Archive -Path (Join-Path $dir.FullName '*') -DestinationPath $zip -CompressionLevel Optimal
-          Get-Item $zip | Format-Table Name, Length
-
-      - name: Publish to the hermes-light release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          files=()
-          for ext in AppImage dmg zip msix msixbundle appinstaller cer; do
-            for f in apps/desktop/release/*."$ext"; do [ -f "$f" ] && files+=("$f"); done
-          done
-          [ ${#files[@]} -gt 0 ] || { echo "no files to publish"; exit 1; }
-          gh release upload hermes-light "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
+          mkdir -p out
+          release=src/apps/desktop/release
+          ls -lh "$release"
+          case "${{ matrix.name }}" in
+            linux-x64)   cp "$release"/*.AppImage out/ ;;
+            macos-arm64) cp "$release"/*.dmg "$release"/*.zip out/ ;;
+            windows-x64)
+              dir=$(ls -d "$release"/win*unpacked | head -1)
+              (cd "$dir" && 7z a -tzip -mx=7 "$GITHUB_WORKSPACE/out/hermes-light-$VERSION-win-x64-portable.zip" . >/dev/null) ;;
+          esac
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG_PREFIX$VERSION"
+          ls -lh out
+          gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          cat > notes.md <<NOTES
+          Hermes Light $VERSION: the remote-only Hermes desktop client, built from
+          [$UPSTREAM v$VERSION](https://github.com/$UPSTREAM/releases/tag/v$VERSION).
+
+          - **Windows:** unzip \`hermes-light-$VERSION-win-x64-portable.zip\` and run \`hermes-light.exe\`.
+          - **macOS (Apple Silicon):** open the \`.dmg\`, then run \`xattr -cr /Applications/hermes-light.app\` (the build is unsigned).
+          - **Linux:** \`chmod +x hermes-light-*.AppImage\` and run it.
+
+          Connect it to your server: Settings → Gateway → Remote gateway, \`http://<server>:9119\` and the token.
+          NOTES
+          gh release create "$tag" out/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Hermes Light $VERSION" --notes-file notes.md --prerelease
