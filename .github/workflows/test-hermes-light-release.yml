@@ -1,4 +1,4 @@
-name: Build Hermes Light
+name: Test Hermes Light release
 
 # Builds the remote-only Hermes desktop client ("light" variant: no Python, no local agent)
 # from the official NousResearch/hermes-agent repository and publishes it as a GitHub release.
